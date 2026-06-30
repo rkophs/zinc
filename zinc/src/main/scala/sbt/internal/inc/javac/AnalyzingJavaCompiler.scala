@@ -198,14 +198,19 @@ final class AnalyzingJavaCompiler private[sbt] (
         }
       }
 
-      // Read the API information from [[Class]] to analyze dependencies.
-      def readAPI(source: VirtualFileRef, classes: Seq[Class[?]]): Set[(String, String)] = {
-        val (apis, mainClasses, inherits) = ClassToAPI.process(classes, log)
+      // Read the API information from [[Class]] to analyze dependencies. Classes whose
+      // reflection blows up mid-flight (sbt/sbt#117 — typically a transitive dep missing
+      // from the analysis classpath) are reported in the second return; JavaAnalyze routes
+      // them to readClassfileAPI for classfile-based extraction.
+      def readAPI(
+          source: VirtualFileRef,
+          classes: Seq[Class[?]]
+      ): (Set[(String, String)], Seq[Class[?]]) = {
+        val (apis, mainClasses, inherits, failed) = ClassToAPI.process(classes, log)
         apis.foreach(callback.api(source, _))
         mainClasses.foreach(callback.mainClass(source, _))
-        inherits.map {
-          case (from, to) => (from.getName, to.getName)
-        }
+        val edges = inherits.map { case (from, to) => (from.getName, to.getName) }
+        (edges, failed)
       }
 
       // Read the API of classes that couldn't be reflectively loaded, from their classfiles

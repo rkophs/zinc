@@ -26,20 +26,64 @@ import sbt.util.Logger
 object ClassToAPI {
   def apply(c: Seq[Class[?]]): Seq[api.ClassLike] = process(c)._1
 
-  // (api, public inherited classes)
+  /**
+   * Per-class robust extraction. A `LinkageError` / `TypeNotPresentException` /
+   * `ClassNotFoundException` raised by reflection mid-flight (typically a transitive
+   * dep that's not on the analysis classpath — sbt/sbt#117) is caught and attributed
+   * to its owner class via the per-Lazy and per-ClassLike tracking in [[ClassMap]].
+   * The offending class's partial entries are rolled back so its API doesn't appear
+   * half-built. The fourth tuple element lists the failed classes; the caller routes
+   * those to the classfile fallback ([[ClassfileToAPI]]) where the parsed `ClassFile`
+   * is already in scope (see `JavaAnalyze`).
+   *
+   * The eager pass through [[toDefinitions]] can throw before any per-class state is
+   * recorded, in which case there's nothing to roll back; the lazy pass through
+   * `cmap.lz` can throw after `cls`/`stat` were appended to `allNonLocalClasses`, in
+   * which case `cmap.classToApis` lets us locate and remove them.
+   *
+   * @return (apis, mainClasses, inherited-edges, failed-classes)
+   */
   def process(
       classes: Seq[Class[?]],
       log: Logger = Logger.Null
-  ): (Seq[api.ClassLike], Seq[String], Set[(Class[?], Class[?])]) = {
+  ): (Seq[api.ClassLike], Seq[String], Set[(Class[?], Class[?])], Seq[Class[?]]) = {
     val cmap = emptyClassMap(log)
-    classes.foreach(toDefinitions(cmap)) // force recording of class definitions
-    cmap.lz.toList
-      .foreach(_.get()) // force thunks to ensure all inherited dependencies are recorded
-    val classApis = cmap.allNonLocalClasses.toSeq
+    val failed = mutable.LinkedHashSet.empty[Class[?]]
+
+    // Eager pass: per-class try/catch. Failures here happen before any cls/stat
+    // were appended (the throw hazards — annotations, typeParameters, isMain — all
+    // run before the `cmap.allNonLocalClasses ++= defs` line in toDefinitions0).
+    classes.foreach { c =>
+      try toDefinitions(cmap)(c)
+      catch {
+        case _: (LinkageError | TypeNotPresentException | ClassNotFoundException) =>
+          failed += c
+      }
+    }
+
+    // Lazy pass: each Lazy is paired with its owner class so a throw is attributed
+    // back to the right class and that class's entries can be rolled back.
+    cmap.lz.toList.foreach { case (owner, l) =>
+      try l.get()
+      catch {
+        case _: (LinkageError | TypeNotPresentException | ClassNotFoundException) =>
+          failed += owner
+      }
+    }
+
+    // Roll back any partial entries for failed classes — they're being routed to
+    // the classfile fallback, which will produce its own ClassLike for the class.
+    for (c <- failed) {
+      cmap.classToApis.remove(c).foreach(defs => cmap.allNonLocalClasses --= defs)
+      cmap.mainClasses -= classCanonicalName(c)
+      cmap.inherited.filterInPlace { case (from, _) => from != c }
+    }
+
+    val apis = cmap.allNonLocalClasses.toSeq
     val mainClasses = cmap.mainClasses.toSeq
-    val inDeps = cmap.inherited.toSet
+    val inherits = cmap.inherited.toSet
     cmap.clear()
-    (classApis, mainClasses, inDeps)
+    (apis, mainClasses, inherits, failed.toSeq)
   }
 
   // Avoiding implicit allocation.
@@ -65,8 +109,14 @@ object ClassToAPI {
   final class ClassMap private[sbt] (
       private[sbt] val memo: mutable.Map[String, Seq[api.ClassLikeDef]],
       private[sbt] val inherited: mutable.Set[(Class[?], Class[?])],
-      private[sbt] val lz: mutable.Buffer[xsbti.api.Lazy[?]],
+      // Each Lazy is paired with the Class[?] whose structure() it forces, so
+      // process() can attribute a LinkageError thrown during forcing back to the
+      // class that owned it (and roll its entries back).
+      private[sbt] val lz: mutable.Buffer[(Class[?], xsbti.api.Lazy[?])],
       private[sbt] val allNonLocalClasses: mutable.Set[api.ClassLike],
+      // Per-class index into allNonLocalClasses so a failed class's entries can be
+      // removed cleanly when reflection throws mid-processing (sbt/sbt#117).
+      private[sbt] val classToApis: mutable.Map[Class[?], Seq[api.ClassLike]],
       private[sbt] val mainClasses: mutable.Set[String],
       private[sbt] val log: Logger
   ) {
@@ -74,6 +124,7 @@ object ClassToAPI {
       memo.clear()
       inherited.clear()
       lz.clear()
+      classToApis.clear()
     }
   }
   def emptyClassMap(log: Logger = Logger.Null): ClassMap =
@@ -82,6 +133,7 @@ object ClassToAPI {
       new mutable.HashSet,
       new mutable.ListBuffer,
       new mutable.HashSet,
+      new mutable.HashMap,
       new mutable.HashSet,
       log
     )
@@ -145,7 +197,7 @@ object ClassToAPI {
       annots,
       tpe,
       lzyS(Empty),
-      lzy(instance, cmap),
+      lzy(instance, cmap, c),
       emptyStringArray,
       children.toArray,
       topLevel,
@@ -160,7 +212,7 @@ object ClassToAPI {
       annots,
       Module,
       lzyS(Empty),
-      lzy(static, cmap),
+      lzy(static, cmap, c),
       emptyStringArray,
       emptyTypeArray,
       topLevel,
@@ -171,6 +223,7 @@ object ClassToAPI {
     val defsEmptyMembers = clsDef :: statDef :: Nil
     cmap.memo(name) = defsEmptyMembers
     cmap.allNonLocalClasses ++= defs
+    cmap.classToApis(c) = defs
 
     if (
       c.getMethods.exists(meth =>
@@ -287,9 +340,9 @@ object ClassToAPI {
 
   @inline private def lzyS[T <: AnyRef](t: T): xsbti.api.Lazy[T] = SafeLazyProxy.strict(t)
   @inline final def lzy[T <: AnyRef](t: => T): xsbti.api.Lazy[T] = SafeLazyProxy(t)
-  private def lzy[T <: AnyRef](t: => T, cmap: ClassMap): xsbti.api.Lazy[T] = {
+  private def lzy[T <: AnyRef](t: => T, cmap: ClassMap, owner: Class[?]): xsbti.api.Lazy[T] = {
     val s = lzy(t)
-    cmap.lz += s
+    cmap.lz += ((owner, s))
     s
   }
 

@@ -130,6 +130,75 @@ class ClassfileToAPISpecification extends UnitSpec {
     }
   }
 
+  // Full path for the sbt/sbt#117 (Mill repro) failure mode: the class loads
+  // reflectively but `c.getMethods` later throws NoClassDefFoundError because its
+  // signature references a transitive type that isn't on the analysis classpath.
+  // ClassToAPI.process should report the class in `failed`, JavaAnalyze should route
+  // it to readClassfileAPI, and the resulting API should still be recorded.
+  it should "route LinkageError-mid-reflection classes through ClassfileToAPI" in {
+    IO.withTemporaryDirectory { temp =>
+      val classesDir = new File(temp, "classes")
+      val libDir = new File(temp, "lib")
+      classesDir.mkdir()
+      libDir.mkdir()
+
+      // Producer compiles against Missing (which lives in libDir, not classesDir).
+      val missing = new File(temp, "Missing.java")
+      IO.write(missing, "public class Missing {}")
+      JavaCompilerForUnitTesting.compileJava(Seq(missing), libDir, Seq.empty)
+
+      val producer = new File(temp, "Producer.java")
+      IO.write(
+        producer,
+        """|public class Producer {
+           |  public Missing foo() { return null; }
+           |  public int answer() { return 42; }
+           |}
+           |""".stripMargin
+      )
+      JavaCompilerForUnitTesting.compileJava(Seq(producer), classesDir, Seq(libDir))
+
+      // Analysis classloader sees classesDir but not libDir. Producer LOADS (its
+      // signature reference to Missing is symbolic), but Producer.getMethods()
+      // resolves Missing and throws NoClassDefFoundError.
+      val callback = JavaCompilerForUnitTesting.analyze(
+        classesDir,
+        Seq(producer),
+        readClassfileAPI =
+          (cb, src, named) => {
+            val (apis, _) = ClassfileToAPI.process(named)
+            apis.foreach(cb.api(src, _))
+          },
+        readAPI = (cb, src, classes) => {
+          val (apis, mainClasses, inherits, failed) = ClassToAPI.process(classes)
+          apis.foreach(cb.api(src, _))
+          mainClasses.foreach(cb.mainClass(src, _))
+          val edges = inherits.map { case (from, to) => (from.getName, to.getName) }
+          (edges, failed)
+        }
+      )
+
+      val recorded = callback.apis.values.flatten.toSet
+      val producerApis = recorded.filter(_.name == "Producer")
+      assert(
+        producerApis.nonEmpty,
+        s"Producer API should be recorded via the classfile fallback. " +
+          s"recorded: ${recorded.map(a => a.name -> a.definitionType).toSeq}"
+      )
+      // The classfile fallback produces both a class and a module ClassLike (matching
+      // the ClassToAPI shape).
+      val producerClass = producerApis
+        .find(_.definitionType == DefinitionType.ClassDef)
+        .getOrElse(fail("no Producer ClassDef recorded"))
+      val defs = producerClass.structure.declared.collect {
+        case d: xsbti.api.Def => d.name
+      }.toSet
+      // `answer()` survives the classfile fallback even though `foo(): Missing` is
+      // what made reflection fail.
+      assert(defs.contains("answer"), s"Producer.answer not in declared: $defs")
+    }
+  }
+
   // Covers the `cf.isInterface` switch in ClassfileToAPI (replacing the previous
   // `Modifier.isInterface(cf.accessFlags)`). The ClassDef vs Trait distinction is what
   // makes name-hashing track interface implementations correctly.

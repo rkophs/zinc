@@ -67,7 +67,7 @@ class ClassToAPISpecification extends UnitSpec {
 
       Using.resource(new java.net.URLClassLoader(Array(outDir.toURI.toURL))) { classloader =>
         val myThread = classloader.loadClass("MyThread")
-        val (apis, _, _) = ClassToAPI.process(Seq(myThread))
+        val (apis, _, _, _) = ClassToAPI.process(Seq(myThread))
         // Force the lazy structure so the inner-class walk runs.
         apis.foreach(_.structure.declared.toIndexedSeq)
         assert(apis.map(_.name).toSet.contains("MyThread"))
@@ -100,7 +100,7 @@ class ClassToAPISpecification extends UnitSpec {
 
       Using.resource(new java.net.URLClassLoader(Array(srcDir.toURI.toURL), null)) { classloader =>
         val outerClass = classloader.loadClass("Outer")
-        val (apis, _, _) = ClassToAPI.process(Seq(outerClass))
+        val (apis, _, _, _) = ClassToAPI.process(Seq(outerClass))
 
         val names = apis.map(_.name).toSet
         assert(names.contains("Outer"))
@@ -141,7 +141,7 @@ class ClassToAPISpecification extends UnitSpec {
 
       Using.resource(new java.net.URLClassLoader(Array(srcDir.toURI.toURL), null)) { classloader =>
         val outerClass = classloader.loadClass("Outer")
-        val (apis, _, _) = ClassToAPI.process(Seq(outerClass))
+        val (apis, _, _, _) = ClassToAPI.process(Seq(outerClass))
 
         val names = apis.map(_.name).toSet
         assert(names.contains("Outer"))
@@ -182,10 +182,62 @@ class ClassToAPISpecification extends UnitSpec {
 
       Using.resource(new java.net.URLClassLoader(Array(srcDir.toURI.toURL), null)) { classloader =>
         val holder = classloader.loadClass("Holder")
-        val (apis, _, _) = ClassToAPI.process(Seq(holder))
+        val (apis, _, _, _) = ClassToAPI.process(Seq(holder))
         assert(apis.map(_.name).toSet.contains("Holder"))
       }
     }
+  }
+
+  // sbt/sbt#117 (Mill repro): a class loads reflectively, but `c.getMethods` later throws
+  // NoClassDefFoundError because its signature references a transitive type that isn't on
+  // the analysis classpath (the `compileMvnDeps` / `provided`-scope pattern). Before
+  // per-class isolation in ClassToAPI.process, a single failure aborted the whole batch and
+  // killed every other class's API too. Now the failure is contained: the broken class
+  // surfaces in `failed`, surviving classes still get APIs.
+  it should "isolate per-class LinkageError so siblings still get APIs" in {
+    IO.withTemporaryDirectory { temp =>
+      val libDir = new File(temp, "lib"); libDir.mkdir()
+      val srcDir = new File(temp, "src"); srcDir.mkdir()
+
+      val missing = new File(temp, "Missing.java")
+      IO.write(missing, "public class Missing {}")
+      compileJava(Seq(missing), libDir, Seq.empty)
+
+      // `Broken` references Missing in a method signature — getMethods will throw on the
+      // analysis classloader (which excludes libDir). `Survivor` doesn't reference Missing
+      // at all — its API should still be extracted.
+      val broken = new File(temp, "Broken.java")
+      IO.write(broken, "public class Broken { public Missing foo() { return null; } }")
+      val survivor = new File(temp, "Survivor.java")
+      IO.write(survivor, "public class Survivor { public int answer() { return 42; } }")
+      compileJava(Seq(broken, survivor), srcDir, Seq(libDir))
+
+      Using.resource(new java.net.URLClassLoader(Array(srcDir.toURI.toURL), null)) { cl =>
+        val brokenClass = cl.loadClass("Broken")
+        val survivorClass = cl.loadClass("Survivor")
+        val (apis, _, _, failed) = ClassToAPI.process(Seq(brokenClass, survivorClass))
+
+        // Broken crashed; its API isn't recorded here (the caller routes it to the classfile
+        // fallback via the `failed` list).
+        assert(failed.map(_.getName) === Seq("Broken"))
+        assert(!apis.exists(_.name == "Broken"))
+
+        // Survivor was processed independently and made it through.
+        assert(apis.exists(_.name == "Survivor"))
+        val survivorClassApi = apis.find(_.name == "Survivor").get
+        val defs = survivorClassApi.structure.declared.collect {
+          case d: xsbti.api.Def => d.name
+        }.toSet
+        assert(defs.contains("answer"))
+      }
+    }
+  }
+
+  it should "report no failures when every class extracts cleanly" in {
+    val cls = classOf[java.lang.Integer]
+    val (apis, _, _, failed) = ClassToAPI.process(Seq(cls))
+    assert(failed.isEmpty)
+    assert(apis.exists(_.name == "java.lang.Integer"))
   }
 
   private def compileJava(files: Seq[File], outputDir: File, classpath: Seq[File]): Unit = {
@@ -241,7 +293,7 @@ class ClassToAPISpecification extends UnitSpec {
       source: VirtualFileRef,
       classes: Seq[Class[?]]
   ): Set[(String, String)] = {
-    val (apis, mainClasses, inherits) = ClassToAPI.process(classes)
+    val (apis, mainClasses, inherits, _) = ClassToAPI.process(classes)
     apis.foreach(callback.api(source, _))
     mainClasses.foreach(callback.mainClass(source, _))
     inherits.map {

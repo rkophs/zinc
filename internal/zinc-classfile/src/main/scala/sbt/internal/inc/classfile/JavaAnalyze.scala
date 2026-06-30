@@ -39,7 +39,12 @@ private[sbt] object JavaAnalyze {
   )(
       analysis: xsbti.AnalysisCallback,
       loader: ClassLoader,
-      readAPI: (VirtualFileRef, Seq[Class[?]]) => Set[(String, String)],
+      // Returns (inheritance-edges, classes-that-crashed-mid-reflection). The failed list
+      // is for the LinkageError-mid-reflection case (sbt/sbt#117): the class loaded but its
+      // signatures reference a type that's not on the analysis classpath, so reflection blows
+      // up partway through. Those get routed below to the classfile fallback exactly like
+      // classes that didn't load at all.
+      readAPI: (VirtualFileRef, Seq[Class[?]]) => (Set[(String, String)], Seq[Class[?]]),
       readClassfileAPI: (VirtualFileRef, Seq[(String, ClassFile)]) => Unit = (_, _) => (),
       // sbt/zinc#145: extra member-ref edges for inlined `static final` constants that javac erases
       // from the bytecode, recovered from the attributed AST. Keyed `fromBinaryName -> onBinaryNames`.
@@ -282,7 +287,16 @@ private[sbt] object JavaAnalyze {
       } processDependency(onBinaryName, DependencyByMemberRef, binaryClassName)
 
       def readInheritanceDependencies(classes: Seq[Class[?]]) = {
-        val api = readAPI(source, classes)
+        val (api, failed) = readAPI(source, classes)
+        // sbt/sbt#117: reflection on a class that referenced a missing transitive dep
+        // blew up mid-flight; route those to the classfile fallback exactly like the
+        // never-loaded case below, since the parsed ClassFile is already in scope.
+        if (failed.nonEmpty) {
+          val failedNamed = failed.flatMap { c =>
+            classFileByBinaryName.get(c.getName).map(c.getName -> _)
+          }
+          if (failedNamed.nonEmpty) trapAndLog(log)(readClassfileAPI(source, failedNamed))
+        }
         // avoid .mapValues(...) because of its viewness (scala/bug#10919)
         api.groupBy(_._1).iterator.map { case (k, v) => k -> v.map(_._2) }
       }

@@ -97,7 +97,10 @@ object JavaCompilerForUnitTesting {
       JavaAnalyze(classFiles, srcFiles, logger, output, finalJarOutput = None)(
         analysisCallback,
         classloader,
-        readAPI(analysisCallback, _, _)
+        // Adapt the test's old-shape readAPI (returns only inheritance edges) to the
+        // new shape (also returns LinkageError-mid-reflection classes). Tests don't
+        // exercise that path here; report no failures.
+        (src, classes) => (readAPI(analysisCallback, src, classes), Seq.empty)
       )
       (srcFiles, analysisCallback)
     }
@@ -124,7 +127,11 @@ object JavaCompilerForUnitTesting {
       classesDir: File,
       srcFiles: Seq[File],
       readClassfileAPI: (AnalysisCallback, VirtualFileRef, Seq[(String, ClassFile)]) => Unit =
-        (_, _, _) => ()
+        (_, _, _) => (),
+      readAPI: (AnalysisCallback, VirtualFileRef, Seq[Class[?]]) => (
+          Set[(String, String)],
+          Seq[Class[?]]
+      ) = (_, _, classes) => (extractParents(classes), Seq.empty)
   ): TestCallback = {
     val srcs: List[VirtualFile] = srcFiles.toList.map(f => new TestVirtualFile(f.toPath))
     val analysisCallback = new TestCallback
@@ -137,7 +144,7 @@ object JavaCompilerForUnitTesting {
     JavaAnalyze(classFiles, srcs, ConsoleLogger(), output, finalJarOutput = None)(
       analysisCallback,
       classloader,
-      (_, classes) => extractParents(classes),
+      readAPI(analysisCallback, _, _),
       readClassfileAPI(analysisCallback, _, _)
     )
     analysisCallback
