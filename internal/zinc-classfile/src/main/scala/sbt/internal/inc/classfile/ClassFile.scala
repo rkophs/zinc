@@ -90,6 +90,15 @@ private[sbt] final case class FieldOrMethodInfo(
 ) {
   def isStatic = (accessFlags & ACC_STATIC) == ACC_STATIC
   def isPublic = (accessFlags & ACC_PUBLIC) == ACC_PUBLIC
+  def isPrivate = (accessFlags & ACC_PRIVATE) == ACC_PRIVATE
+  def isProtected = (accessFlags & ACC_PROTECTED) == ACC_PROTECTED
+  def isFinal = (accessFlags & ACC_FINAL) == ACC_FINAL
+  def isAbstract = (accessFlags & ACC_ABSTRACT) == ACC_ABSTRACT
+  def isVarArgs = (accessFlags & ACC_VARARGS) == ACC_VARARGS
+  def isBridge = (accessFlags & ACC_BRIDGE) == ACC_BRIDGE
+  def isSynthetic = (accessFlags & ACC_SYNTHETIC) == ACC_SYNTHETIC
+  def isConstructor = name.exists(_ == "<init>")
+  def isStaticInit = name.exists(_ == "<clinit>")
   def isMain =
     isPublic && isStatic && name.contains("main") &&
       descriptor.exists(_ == "([Ljava/lang/String;)V")
@@ -119,8 +128,15 @@ private[sbt] final case class InnerClassInfo(
   def isPublic = (accessFlags & ACC_PUBLIC) == ACC_PUBLIC
 }
 private[sbt] object Constants {
-  final val ACC_STATIC = 0x0008
   final val ACC_PUBLIC = 0x0001
+  final val ACC_PRIVATE = 0x0002
+  final val ACC_PROTECTED = 0x0004
+  final val ACC_STATIC = 0x0008
+  final val ACC_FINAL = 0x0010
+  final val ACC_BRIDGE = 0x0040
+  final val ACC_VARARGS = 0x0080
+  final val ACC_ABSTRACT = 0x0400
+  final val ACC_SYNTHETIC = 0x1000
 
   final val JavaMagic = 0xcafebabe
   final val ConstantUTF8 = 1

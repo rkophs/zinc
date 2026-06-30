@@ -64,4 +64,33 @@ class ParserSpecification extends UnitSpec {
     assert(entry.get.isPublic)
   }
 
+  it should "expose FieldOrMethodInfo predicates against a JDK class" in {
+    val logger = ConsoleLogger()
+    val cf = Parser(sbt.io.IO.classfileLocation(classOf[java.util.AbstractMap[?, ?]]), logger)
+    val ctor = cf.methods.find(_.isConstructor).getOrElse(fail("no <init> in AbstractMap"))
+    assert(!ctor.isStatic)
+    assert(ctor.name.contains("<init>"))
+    val clinitOpt = cf.methods.find(_.isStaticInit)
+    clinitOpt.foreach { clinit =>
+      assert(clinit.isStatic)
+      assert(clinit.name.contains("<clinit>"))
+    }
+    // AbstractMap declares abstract `entrySet`
+    val entrySet = cf.methods.find(_.name.contains("entrySet")).getOrElse(fail("no entrySet"))
+    assert(entrySet.isAbstract)
+    assert(entrySet.isPublic)
+  }
+
+  it should "detect varargs on a varargs method" in {
+    val logger = ConsoleLogger()
+    val cf = Parser(sbt.io.IO.classfileLocation(classOf[String]), logger)
+    // String.format(Locale, String, Object...) is varargs
+    val format =
+      cf.methods.find(m => m.name.contains("format") && m.isVarArgs).getOrElse(
+        fail("no varargs format(...) found on String")
+      )
+    assert(format.isVarArgs)
+    assert(format.isStatic)
+    assert(format.isPublic)
+  }
 }

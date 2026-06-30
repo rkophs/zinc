@@ -188,6 +188,118 @@ class ClassToAPISpecification extends UnitSpec {
     }
   }
 
+  // sbt/sbt#117 (reflection-fallback). When reflection on a class with a method that
+  // references a missing type throws, the dispatcher in ClassToAPI.structure must fall
+  // back to classfile parsing rather than aborting API extraction for the whole class.
+  it should "fall back to classfile parser when a method return type is missing" in {
+    withMissingDep("public Missing foo() { return null; }") { apis =>
+      val outer = apis.find(_.name == "Outer").get
+      val foo = outer.structure.declared.collectFirst {
+        case d: xsbti.api.Def if d.name == "foo" => d
+      }.getOrElse(fail(s"foo() not in declared: ${outer.structure.declared.toSeq}"))
+      assert(projectionId(foo.returnType).contains("Missing"))
+    }
+  }
+
+  it should "fall back to classfile parser when a method parameter type is missing" in {
+    withMissingDep("public void foo(Missing m) {}") { apis =>
+      val outer = apis.find(_.name == "Outer").get
+      val foo = outer.structure.declared.collectFirst {
+        case d: xsbti.api.Def if d.name == "foo" => d
+      }.getOrElse(fail("foo(Missing) not in declared"))
+      val paramType = foo.valueParameters.head.parameters.head.tpe
+      assert(projectionId(paramType).contains("Missing"))
+    }
+  }
+
+  it should "fall back to classfile parser when a field type is missing" in {
+    withMissingDep("public Missing field;") { apis =>
+      val outer = apis.find(_.name == "Outer").get
+      val field = outer.structure.declared.collectFirst {
+        case v: xsbti.api.Var if v.name == "field" => v
+      }.getOrElse(fail("field not in declared"))
+      assert(projectionId(field.tpe).contains("Missing"))
+    }
+  }
+
+  // Regression: inherited members carry attributes whose constant-pool indices belong
+  // to the *parent's* classfile, not the child's. The classfile fallback must read those
+  // attributes through the parent's ClassFile. ConstantValue on an inherited static
+  // final primitive is the PR-1 surface for this (no annotation reading yet).
+  it should "read inherited static-final ConstantValue against the parent's constant pool" in {
+    IO.withTemporaryDirectory { temp =>
+      val libDir = new File(temp, "lib"); libDir.mkdir()
+      val srcDir = new File(temp, "src"); srcDir.mkdir()
+
+      val missing = new File(temp, "Missing.java")
+      IO.write(missing, "public class Missing {}")
+      compileJava(Seq(missing), libDir, Seq.empty)
+
+      val parent = new File(temp, "Parent.java")
+      IO.write(
+        parent,
+        """|public class Parent {
+           |  // Reference to Missing forces the reflection path to throw, triggering
+           |  // the classfile fallback on Child too.
+           |  public Missing dep() { return null; }
+           |  public static final int CONST = 42;
+           |}
+           |""".stripMargin
+      )
+      val child = new File(temp, "Child.java")
+      IO.write(child, "public class Child extends Parent {}")
+      compileJava(Seq(parent, child), srcDir, Seq(libDir))
+
+      Using.resource(new java.net.URLClassLoader(Array(srcDir.toURI.toURL), null)) { cl =>
+        val childClass = cl.loadClass("Child")
+        val (apis, _, _) = ClassToAPI.process(Seq(childClass))
+        // CONST is public-static-final, so it lives on Child's static structure (the
+        // module companion), in `inherited` (since it's inherited from Parent). The
+        // fallback's cfFieldToDef wraps it in a Singleton derived from the ConstantValue
+        // attribute read against the *parent's* classfile.
+        val childModule = apis
+          .find(a => a.name == "Child" && a.definitionType == DefinitionType.Module)
+          .getOrElse(fail("no Child module"))
+        val inheritedConst = childModule.structure.inherited.collectFirst {
+          case v: xsbti.api.Val if v.name == "CONST" => v
+        }.getOrElse {
+          fail(
+            s"CONST not in Child module structure.inherited: ${childModule.structure.inherited.toSeq}"
+          )
+        }
+        // The Singleton path renders the int value into a synthetic name; the proof
+        // that we read against the right pool is that this didn't crash with a
+        // ConstantUTF8 / IndexOutOfBounds error in Parser#toUTF8.
+        assert(inheritedConst.tpe.isInstanceOf[xsbti.api.Singleton])
+      }
+    }
+  }
+
+  private def withMissingDep(memberSrc: String)(check: Seq[xsbti.api.ClassLike] => Unit): Unit =
+    IO.withTemporaryDirectory { temp =>
+      val libDir = new File(temp, "lib"); libDir.mkdir()
+      val srcDir = new File(temp, "src"); srcDir.mkdir()
+
+      val missingFile = new File(temp, "Missing.java")
+      IO.write(missingFile, "public class Missing {}")
+      compileJava(Seq(missingFile), libDir, Seq.empty)
+
+      val outerFile = new File(temp, "Outer.java")
+      IO.write(outerFile, s"public class Outer {\n  $memberSrc\n}\n")
+      compileJava(Seq(outerFile), srcDir, Seq(libDir))
+
+      Using.resource(new java.net.URLClassLoader(Array(srcDir.toURI.toURL), null)) { cl =>
+        val outerClass = cl.loadClass("Outer")
+        val (apis, _, _) = ClassToAPI.process(Seq(outerClass))
+        check(apis)
+      }
+    }
+
+  private def projectionId(t: xsbti.api.Type): Option[String] = t match {
+    case p: xsbti.api.Projection => Some(p.id)
+    case _                       => None
+  }
+
   private def compileJava(files: Seq[File], outputDir: File, classpath: Seq[File]): Unit = {
     import javax.tools.{ StandardLocation, ToolProvider }
     import scala.jdk.CollectionConverters._

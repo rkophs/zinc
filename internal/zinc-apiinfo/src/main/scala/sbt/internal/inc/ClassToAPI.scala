@@ -16,7 +16,7 @@ package inc
 import java.lang.reflect.{ Array => _, _ }
 import java.lang.annotation.Annotation
 import annotation.tailrec
-import inc.classfile.ClassFile
+import inc.classfile.{ ClassFile, FieldOrMethodInfo }
 import xsbti.api
 import xsbti.api.SafeLazyProxy
 import collection.mutable
@@ -172,23 +172,36 @@ object ClassToAPI {
     cmap.memo(name) = defsEmptyMembers
     cmap.allNonLocalClasses ++= defs
 
-    if (
-      c.getMethods.exists(meth =>
-        meth.getName == "main" &&
-          Modifier.isStatic(meth.getModifiers) &&
-          meth.getParameterTypes.length == 1 &&
-          meth.getParameterTypes.head == classOf[Array[String]] &&
-          meth.getReturnType == java.lang.Void.TYPE
-      )
-    ) {
+    if (hasMainSafe(c)) {
       cmap.mainClasses += name
     }
 
     defsEmptyMembers
   }
 
-  /** Returns the (static structure, instance structure, inherited classes) for `c`. */
+  /**
+   * Returns the (static structure, instance structure) for `c`.
+   *
+   * Reflection is the primary path. When the JVM can't resolve a referenced type —
+   * typically a transitive dependency marked optional/provided that isn't on the
+   * analysis classpath — `c.getMethods`/`getFields`/etc. throw `LinkageError` or
+   * `TypeNotPresentException`. Fall back to parsing the classfile directly, which
+   * doesn't trigger any further class loading. The classfile fallback produces
+   * lower-fidelity output (no annotations or @throws yet — see follow-ups), but
+   * doesn't abort the whole API extraction.
+   */
   def structure(
+      c: Class[?],
+      enclPkg: Option[String],
+      cmap: ClassMap
+  ): (api.Structure, api.Structure) =
+    try structureReflective(c, enclPkg, cmap)
+    catch {
+      case _: (LinkageError | TypeNotPresentException | ClassNotFoundException) =>
+        structureFromClassfile(c, enclPkg, cmap)
+    }
+
+  private def structureReflective(
       c: Class[?],
       enclPkg: Option[String],
       cmap: ClassMap
@@ -229,6 +242,220 @@ object ClassToAPI {
     (staticStructure, instanceStructure)
   }
 
+  private def structureFromClassfile(
+      c: Class[?],
+      enclPkg: Option[String],
+      cmap: ClassMap
+  ): (api.Structure, api.Structure) = {
+    val cf = classFileForClass(c)
+
+    val declaredMethods = cf.methods.filter(m =>
+      !m.isConstructor && !m.isStaticInit && !m.isBridge && !m.isSynthetic
+    )
+    val declaredConstructors = cf.methods.filter(m => m.isConstructor && !m.isSynthetic)
+    val declaredFields = cf.fields
+
+    val inheritedMethods = cfPublicInherited(
+      c,
+      _.methods.filter(m =>
+        m.isPublic && !m.isConstructor && !m.isStaticInit && !m.isBridge && !m.isSynthetic
+      )
+    )
+    val inheritedFields = cfPublicInherited(c, _.fields.filter(_.isPublic))
+
+    val methods = cfMerge(declaredMethods, inheritedMethods, cfMethodToDef(enclPkg))
+    val fields = cfMerge(declaredFields, inheritedFields, cfFieldToDef(c, cf, enclPkg))
+    // Constructors are never inherited.
+    val constructors =
+      cfMerge(declaredConstructors, Seq.empty, cfConstructorToDef(c, enclPkg))
+    val classes = innerClassesFromClassfile(c, cf, cmap)
+    val all = methods ++ fields ++ constructors ++ classes
+
+    val parentJavaTypes = allSuperTypesSafe(c)
+    if (!Modifier.isPrivate(c.getModifiers))
+      cmap.inherited ++= parentJavaTypes.collect { case parent: Class[?] => c -> parent }
+    val parentTypes = types(parentJavaTypes)
+    val instanceStructure =
+      api.Structure.of(lzyS(parentTypes), lzyS(all.declared.toArray), lzyS(all.inherited.toArray))
+    val staticStructure = api.Structure.of(
+      lzyEmptyTpeArray,
+      lzyS(all.staticDeclared.toArray),
+      lzyS(all.staticInherited.toArray)
+    )
+    (staticStructure, instanceStructure)
+  }
+
+  /**
+   * Best-effort supertype walk for the classfile fallback: tolerates the same
+   * reflection failures that triggered the fallback.
+   *
+   * TODO: returning Seq.empty on failure drops two pieces of information that
+   * incremental compilation relies on: (1) the inheritance edges in
+   * `cmap.inherited`, which gate downstream invalidation when a parent's API
+   * changes, and (2) the parent types in the instance Structure, which feed
+   * into the class's API hash. A proper fallback should:
+   *   1. Retry with raw `getSuperclass` / `getInterfaces` (no generics) — most
+   *      TypeNotPresentException cases come from parameterized supertypes like
+   *      `extends Foo<Missing>` and raw reflection sidesteps the type-arg
+   *      resolution.
+   *   2. If raw reflection still throws, read `cf.superClassName` and
+   *      `cf.interfaceNames` from the classfile (just strings — no class
+   *      loading) to populate `parentTypes`, and try `cl.loadClass(name)` per
+   *      parent for inherited-member enumeration, skipping parents the
+   *      classloader can't resolve.
+   */
+  private def allSuperTypesSafe(c: Class[?]): Seq[Type] =
+    try allSuperTypes(c)
+    catch {
+      case _: (LinkageError | TypeNotPresentException | ClassNotFoundException) => Seq.empty
+    }
+
+  /**
+   * Main-class detection on a class whose reflection signature touches a missing
+   * type would crash before the lazy `structure` dispatcher gets a chance to
+   * catch it. Such a class can't actually run its main anyway (the JVM would
+   * fail the same way), so degrading to `false` is harmless.
+   */
+  private def hasMainSafe(c: Class[?]): Boolean =
+    try
+      c.getMethods.exists(meth =>
+        meth.getName == "main" &&
+          Modifier.isStatic(meth.getModifiers) &&
+          meth.getParameterTypes.length == 1 &&
+          meth.getParameterTypes.head == classOf[Array[String]] &&
+          meth.getReturnType == java.lang.Void.TYPE
+      )
+    catch {
+      case _: (LinkageError | TypeNotPresentException | ClassNotFoundException) => false
+    }
+
+  /**
+   * Returns members from supertypes paired with the supertype's `(Class, ClassFile)` so
+   * downstream code can read each member's attributes against the correct constant pool
+   * (attribute bytes contain indices that only make sense within the originating
+   * classfile). Even though PR-1 doesn't read those attributes, the plumbing pays off as
+   * soon as annotations / `@throws` reading lands.
+   */
+  private def cfPublicInherited(
+      c: Class[?],
+      select: ClassFile => Array[FieldOrMethodInfo]
+  ): Seq[(Class[?], ClassFile, FieldOrMethodInfo)] =
+    allSuperTypesSafe(c).collect { case parent: Class[?] =>
+      val pcf = classFileForClass(parent)
+      select(pcf).iterator.map(m => (parent, pcf, m)).toSeq
+    }.flatten
+
+  private def cfMerge(
+      declared: Array[FieldOrMethodInfo],
+      inherited: Seq[(Class[?], ClassFile, FieldOrMethodInfo)],
+      toDef: (Class[?], ClassFile, FieldOrMethodInfo) => api.ClassDefinition
+  ): Defs = {
+    val (selfStatic, selfInstance) = declared.partition(_.isStatic)
+    val (inhStatic, inhInstance) = inherited.partition(_._3.isStatic)
+    Defs(
+      selfInstance.iterator.map(toDef(null, null, _)).toSeq,
+      inhInstance.iterator.map { case (pc, pcf, m) => toDef(pc, pcf, m) }.toSeq,
+      selfStatic.iterator.map(toDef(null, null, _)).toSeq,
+      inhStatic.iterator.map { case (pc, pcf, m) => toDef(pc, pcf, m) }.toSeq
+    )
+  }
+
+  private def cfAccess(m: FieldOrMethodInfo, pkg: Option[String]): api.Access =
+    if (m.isPublic) Public
+    else if (m.isPrivate) Private
+    else if (m.isProtected) Protected
+    else packagePrivate(pkg)
+
+  private def cfModifiers(m: FieldOrMethodInfo): api.Modifiers =
+    new api.Modifiers(m.isAbstract, false, m.isFinal, false, false, false, false, false)
+
+  private def cfMethodToDef(
+      enclPkg: Option[String]
+  )(declaringClass: Class[?], cf: ClassFile, m: FieldOrMethodInfo): api.ClassDefinition = {
+    val _ = (declaringClass, cf) // unused in PR-1 (no annotation reading)
+    val mName = m.name.getOrElse("")
+    val (paramTypes, retType) = m.descriptor
+      .map(DescriptorParser.methodTypes)
+      .getOrElse((Array.empty[api.Type], Empty))
+    val params = cfParameterList(m, paramTypes)
+    api.Def.of(
+      mName,
+      cfAccess(m, enclPkg),
+      cfModifiers(m),
+      emptyAnnotationArray,
+      emptyTypeParameterArray,
+      Array(params),
+      retType
+    )
+  }
+
+  private def cfFieldToDef(
+      selfClass: Class[?],
+      selfCf: ClassFile,
+      enclPkg: Option[String]
+  )(
+      declaringClass: Class[?],
+      declaringCf: ClassFile,
+      f: FieldOrMethodInfo
+  ): api.ClassDefinition = {
+    val dc = if (declaringClass eq null) selfClass else declaringClass
+    val dcf = if (declaringCf eq null) selfCf else declaringCf
+    val fName = f.name.getOrElse("")
+    val fType = f.descriptor.map(DescriptorParser.fieldType).getOrElse(Empty)
+    val mods = cfModifiers(f)
+    val accs = cfAccess(f, enclPkg)
+    val specificTpe: Option[api.Type] =
+      if (mods.isFinal)
+        dcf.constantValue(fName).map { v =>
+          api.Singleton.of(
+            pathFromStrings(
+              dc.getName.split("\\.").toSeq :+
+                (fName + "$" + f.descriptor.getOrElse("") + "$" + v)
+            )
+          )
+        }
+      else None
+    val tpe = specificTpe.getOrElse(fType)
+    if (mods.isFinal) api.Val.of(fName, accs, mods, emptyAnnotationArray, tpe)
+    else api.Var.of(fName, accs, mods, emptyAnnotationArray, tpe)
+  }
+
+  private def cfConstructorToDef(
+      selfClass: Class[?],
+      enclPkg: Option[String]
+  )(declaringClass: Class[?], cf: ClassFile, m: FieldOrMethodInfo): api.ClassDefinition = {
+    val _ = cf // unused in PR-1
+    val dc = if (declaringClass eq null) selfClass else declaringClass
+    val cName = s"${dc.getName.replace('.', ';')};init;"
+    val (paramTypes, _) = m.descriptor
+      .map(DescriptorParser.methodTypes)
+      .getOrElse((Array.empty[api.Type], Empty))
+    val params = cfParameterList(m, paramTypes)
+    api.Def.of(
+      cName,
+      cfAccess(m, enclPkg),
+      cfModifiers(m),
+      emptyAnnotationArray,
+      emptyTypeParameterArray,
+      Array(params),
+      Empty
+    )
+  }
+
+  private def cfParameterList(
+      m: FieldOrMethodInfo,
+      paramTypes: Array[api.Type]
+  ): api.ParameterList = {
+    val lastIdx = paramTypes.length - 1
+    val params = paramTypes.zipWithIndex.map { case (tpe, i) =>
+      val modifier =
+        if (m.isVarArgs && i == lastIdx) api.ParameterModifier.Repeated
+        else api.ParameterModifier.Plain
+      api.MethodParameter.of("", tpe, false, modifier)
+    }
+    api.ParameterList.of(params, false)
+  }
+
   /** Enumerates inner classes from the classfile instead of reflection. sbt/sbt#117 */
   private def innerClassesFromClassfile(
       c: Class[?],
@@ -243,9 +470,11 @@ object ClassToAPI {
     for (info <- cf.innerClasses if info.outerClassName == name) {
       loadInnerClass(cl, info, cmap.log).foreach(declaredClasses += _)
     }
-    // inherited public inner classes from parent classfiles
+    // inherited public inner classes from parent classfiles. Use the safe variant so
+    // that the classfile fallback (which is invoked precisely because reflection on a
+    // parent's generic supertypes threw) doesn't immediately re-trip the same error.
     for {
-      parent <- allSuperTypes(c).collect { case c: Class[?] => c }
+      parent <- allSuperTypesSafe(c).collect { case c: Class[?] => c }
       parentCf = classFileForClass(parent)
       info <- parentCf.innerClasses if info.outerClassName == parent.getName && info.isPublic
     } {
